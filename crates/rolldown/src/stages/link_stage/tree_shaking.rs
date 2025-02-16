@@ -147,25 +147,31 @@ impl LinkStage<'_> {
       is_module_included_vec: &mut is_module_included_vec,
       tree_shaking: self.options.treeshake.enabled(),
       runtime_id: self.runtime.id(),
-      // used_exports_info_vec: &mut used_exports_info_vec,
       metas: &self.metas,
       used_symbol_refs: &mut self.used_symbol_refs,
     };
 
-    self.entries.iter().for_each(|entry| {
-      let module = match &self.module_table.modules[entry.id] {
-        Module::Normal(module) => module,
-        Module::External(_module) => {
-          // Case: import('external').
-          return;
-        }
-      };
-      let meta = &self.metas[entry.id];
-      meta.referenced_symbols_by_entry_point_chunk.iter().for_each(|symbol_ref| {
-        include_symbol(context, *symbol_ref);
-      });
-      include_module(context, module);
-    });
+    let dynamic_import_entries = self
+      .entries
+      .iter()
+      .filter(|entry| {
+        let module = match &self.module_table.modules[entry.id] {
+          Module::Normal(module) => module,
+          Module::External(_module) => {
+            // Case: import('external').
+            return false;
+          }
+        };
+
+        let meta = &self.metas[entry.id];
+        meta.referenced_symbols_by_entry_point_chunk.iter().for_each(|symbol_ref| {
+          include_symbol(context, *symbol_ref);
+        });
+        include_module(context, module);
+
+        entry.kind.is_dynamic_import()
+      })
+      .collect::<FxHashSet<_>>();
 
     self.module_table.modules.par_iter_mut().filter_map(Module::as_normal_mut).for_each(|module| {
       let idx = module.idx;
@@ -174,6 +180,55 @@ impl LinkStage<'_> {
         module.stmt_infos.get_mut(stmt_info_id).is_included = *is_included;
       });
     });
+
+    // A dynamic module can only be included if it has statements or symbols that are included,
+    // or if it is included by another module.
+    let has_dynamic_empty_module = dynamic_import_entries.into_iter().any(|entry| {
+      let has_been_imported = entry.related_stmt_infos.iter().any(|(module_idx, stmt_idx)| {
+        let module = self.module_table.modules[*module_idx].as_normal().unwrap();
+        module.stmt_infos[*stmt_idx].is_included
+      });
+
+      let module = self.module_table.modules[entry.id].as_normal_mut().unwrap();
+      let has_side_effect = module.stmt_infos.iter().any(|stmt_info| stmt_info.is_included);
+
+      let is_included = has_been_imported && has_side_effect;
+      module.meta.set(EcmaViewMeta::INCLUDED, is_included);
+
+      let is_empty_module = !is_included;
+
+      if is_empty_module {
+        for (module_idx, stmt_info_id) in &entry.related_stmt_infos {
+          let module = self.module_table.modules[*module_idx].as_normal_mut().unwrap();
+
+          module.stmt_infos[*stmt_info_id]
+            .referenced_symbols
+            .push(self.runtime.resolve_symbol("__dynamicEmpty").into());
+
+          self.metas[*module_idx].dependencies.insert(entry.id);
+        }
+      }
+
+      is_empty_module
+    });
+
+    if has_dynamic_empty_module {
+      let symbol_ref = self.runtime.resolve_symbol("__dynamicEmpty");
+
+      if let Some(module) = self.module_table.modules[symbol_ref.owner].as_normal_mut() {
+        module.meta.set(EcmaViewMeta::INCLUDED, true);
+        let stmt_infos = module
+          .stmt_infos
+          .declared_stmts_by_symbol(&symbol_ref)
+          .iter()
+          .copied()
+          .collect::<Vec<_>>();
+
+        for stmt_info_id in stmt_infos {
+          module.stmt_infos.get_mut(stmt_info_id).is_included = true;
+        }
+      }
+    }
 
     tracing::trace!(
       "included statements {:#?}",

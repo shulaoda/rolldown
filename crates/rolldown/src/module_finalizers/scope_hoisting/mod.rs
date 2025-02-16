@@ -804,6 +804,21 @@ impl<'me, 'ast> ScopeHoistingFinalizer<'me, 'ast> {
     &mut self,
     import_expr: &mut ImportExpression<'ast>,
   ) -> Option<Expression<'ast>> {
+    let rec_id = self.ctx.module.imports.get(&import_expr.span)?;
+    let rec = &self.ctx.module.import_records[*rec_id];
+    let importee_id = rec.resolved_module;
+
+    if let Some(module) = self.ctx.modules[importee_id].as_normal() {
+      if !module.is_included() {
+        // Rewrite `import('./foo.mjs')` to `Promise.resolve().then(function () { return init_foo; });`
+        let empty_module = self.snippet.id_ref_expr("__dynamicEmpty", SPAN);
+        return Some(self.snippet.promise_resolve_then_call_expr(
+          import_expr.span,
+          self.snippet.builder.vec1(self.snippet.return_stmt(empty_module)),
+        ));
+      }
+    }
+
     if self.ctx.options.inline_dynamic_imports {
       let rec_id = self.ctx.module.imports.get(&import_expr.span)?;
       let rec = &self.ctx.module.import_records[*rec_id];
